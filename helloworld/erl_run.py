@@ -123,7 +123,13 @@ def get_rewards_and_steps(env, actor, if_render: bool = False) -> (float, int):
     for episode_steps in range(12345):
         tensor_state = th.as_tensor(state, dtype=th.float32, device=device).unsqueeze(0)
         tensor_action = actor(tensor_state)
+     
+        import torch
+        tensor_action = torch.argmax(tensor_action).unsqueeze(dim=0)
+        
         action = tensor_action.detach().cpu().numpy()[0]  # not need detach(), because using torch.no_grad() outside
+        
+        
         state, reward, terminated, truncated, _ = env.step(action)
         cumulative_returns += reward
 

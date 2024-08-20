@@ -200,7 +200,7 @@ def layer_init_with_orthogonal(layer, std=1.0, bias_const=1e-6):
 '''AgentDQN'''
 
 
-class QNetwork(nn.Module):  # `nn.Module` is a PyTorch module for neural network
+class QNetwork(nn.Module):  # `nn.Module` is a Pyth module for neural network
     def __init__(self, net_dims: List[int], state_dim: int, action_dim: int):
         super().__init__()
         self.net = build_mlp(dims=[state_dim, *net_dims, action_dim])
@@ -258,32 +258,51 @@ class ActorPPO(nn.Module):
         super().__init__()
         self.net = build_mlp(dims=[state_dim, *net_dims, action_dim])
         self.action_std_log = nn.Parameter(th.zeros((1, action_dim)), requires_grad=True)  # trainable parameter
-        self.ActionDist = torch.distributions.normal.Normal
+        
+        
+        self.if_discrete = True
+        self.ActionDist =  torch.distributions.categorical.Categorical \
+                        if self.if_discrete else \
+                            torch.distributions.normal.Normal
 
-    def forward(self, state: TEN) -> TEN:
+
+    def forward(self, state: th.Tensor) -> th.Tensor:
         action = self.net(state)
         return self.convert_action_for_env(action)
 
-    def get_action(self, state: TEN) -> Tuple[TEN, TEN]:  # for exploration
+    def get_action(self, state: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:  # for exploration
         action_avg = self.net(state)
-        action_std = self.action_std_log.exp()
 
-        dist = self.ActionDist(action_avg, action_std)
-        action = dist.sample()
-        logprob = dist.log_prob(action).sum(1)
+        if self.if_discrete:
+            dist = self.ActionDist(logits=action_avg)
+            action = dist.sample()
+            logprob = dist.log_prob(action)
+
+        else:
+            action_std = self.action_std_log.exp()
+            dist = self.ActionDist(action_avg, action_std)
+            action = dist.sample()
+            logprob = dist.log_prob(action).sum(1)
         return action, logprob
 
-    def get_logprob_entropy(self, state: TEN, action: TEN) -> Tuple[TEN, TEN]:
+    def get_logprob_entropy(self, state: th.Tensor, action: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
         action_avg = self.net(state)
-        action_std = self.action_std_log.exp()
 
-        dist = self.ActionDist(action_avg, action_std)
-        logprob = dist.log_prob(action).sum(1)
-        entropy = dist.entropy().sum(1)
+        if self.if_discrete:
+            # print(action_avg)
+            dist = self.ActionDist(logits=action_avg)
+            logprob = dist.log_prob(th.squeeze(action))
+            entropy = dist.entropy()
+        else:
+            action_std = self.action_std_log.exp()
+            dist = self.ActionDist(action_avg, action_std)
+            logprob = dist.log_prob(action).sum(1)
+            entropy = dist.entropy().sum(1)
+
         return logprob, entropy
 
     @staticmethod
-    def convert_action_for_env(action: TEN) -> TEN:
+    def convert_action_for_env(action: th.Tensor) -> th.Tensor:
         return action.tanh()
 
 
@@ -292,13 +311,16 @@ class CriticPPO(nn.Module):
         super().__init__()
         self.net = build_mlp(dims=[state_dim, *net_dims, 1])
 
-    def forward(self, state: TEN) -> TEN:
+    def forward(self, state: th.Tensor) -> th.Tensor:
         return self.net(state)  # advantage value
 
 
 class AgentPPO(AgentBase):
     def __init__(self, net_dims: List[int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
         super().__init__(net_dims, state_dim, action_dim, gpu_id, args)
+
+        self.agrs = args
+
         self.if_off_policy = False
 
         self.act = ActorPPO(net_dims=net_dims, state_dim=state_dim, action_dim=action_dim).to(self.device)
@@ -314,9 +336,14 @@ class AgentPPO(AgentBase):
         self.lambda_entropy = getattr(args, "lambda_entropy", 0.01)  # could be 0.00~0.10
         self.lambda_entropy = th.tensor(self.lambda_entropy, dtype=th.float32, device=self.device)
 
-    def explore_env(self, env, horizon_len: int, **kwargs) -> Tuple[TEN, TEN, TEN, TEN, TEN, TEN]:
+    def explore_env(self, env, horizon_len: int, **kwargs) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        
+        if_discrete = True
+
+        buf_action_dim = 1 if if_discrete else self.action_dim
+        
         states = th.zeros((horizon_len, self.state_dim), dtype=th.float32).to(self.device)
-        actions = th.zeros((horizon_len, self.action_dim), dtype=th.float32).to(self.device)
+        actions = th.zeros((horizon_len, buf_action_dim), dtype=th.float32).to(self.device)
         logprobs = th.zeros(horizon_len, dtype=th.float32).to(self.device)
         rewards = th.zeros(horizon_len, dtype=th.float32).to(self.device)
         terminals = th.zeros(horizon_len, dtype=th.bool).to(self.device)
@@ -328,13 +355,18 @@ class AgentPPO(AgentBase):
             state = th.as_tensor(ary_state, dtype=th.float32, device=self.device)
             action, logprob = self.explore_action(state)
 
-            ary_action = convert(action).detach().cpu().numpy()
+            if self.agrs.if_discrete:
+                ary_action = action.item()
+            else:
+                ary_action = convert(action).detach().cpu().numpy()
+
             ary_state, reward, terminal, truncate, _ = env.step(ary_action)
             if terminal or truncate:
                 ary_state, info_dict = env.reset()
 
             states[i] = state
             actions[i] = action
+            logprobs[i] = logprob
             rewards[i] = reward
             terminals[i] = terminal
             truncates[i] = truncate
@@ -345,7 +377,7 @@ class AgentPPO(AgentBase):
         unmasks = th.logical_not(truncates).unsqueeze(1)
         return states, actions, logprobs, rewards, undones, unmasks
 
-    def explore_action(self, state: TEN) -> Tuple[TEN, TEN]:
+    def explore_action(self, state: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
         actions, logprobs = self.act.get_action(state.unsqueeze(0))
         return actions[0], logprobs[0]
 
@@ -367,6 +399,8 @@ class AgentPPO(AgentBase):
 
         buffer = states, actions, unmasks, logprobs, advantages, reward_sums
 
+        # print(buffer)
+
         '''update network'''
         obj_critics = []
         obj_actors = []
@@ -385,7 +419,7 @@ class AgentPPO(AgentBase):
         a_std_log = getattr(self.act, 'a_std_log', th.zeros(1)).mean()
         return obj_critic_avg, obj_actor_avg, a_std_log.item()
 
-    def update_objectives(self, buffer: Tuple[TEN, ...], batch_size: int, _update_t: int) -> Tuple[float, float]:
+    def update_objectives(self, buffer: Tuple[th.Tensor, ...], batch_size: int, _update_t: int) -> Tuple[float, float]:
         states, actions, unmasks, logprobs, advantages, reward_sums = buffer
 
         buffer_size = states.shape[0]
@@ -402,6 +436,7 @@ class AgentPPO(AgentBase):
         self.optimizer_backward(self.cri_optimizer, obj_critic)
 
         new_logprob, obj_entropy = self.act.get_logprob_entropy(state, action)
+        # print(new_logprob, logprob, logprobs)
         ratio = (new_logprob - logprob.detach()).exp()
         surrogate1 = advantage * ratio
         surrogate2 = advantage * ratio.clamp(1 - self.ratio_clip, 1 + self.ratio_clip)
@@ -410,7 +445,7 @@ class AgentPPO(AgentBase):
         self.optimizer_backward(self.act_optimizer, -obj_actor)
         return obj_critic.item(), obj_actor.item()
 
-    def get_advantages(self, states: TEN, rewards: TEN, undones: TEN, unmasks: TEN, values: TEN) -> TEN:
+    def get_advantages(self, states: th.Tensor, rewards: th.Tensor, undones: th.Tensor, unmasks: th.Tensor, values: th.Tensor) -> th.Tensor:
         advantages = th.empty_like(values)  # advantage value
 
         # update undones rewards when truncated
@@ -431,7 +466,6 @@ class AgentPPO(AgentBase):
             advantages[t] = advantage = delta + masks[t] * self.lambda_gae_adv * advantage
             next_value = values[t]
         return advantages
-
 
 '''AgentDDPG'''
 
